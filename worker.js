@@ -207,31 +207,31 @@ async function resolveYtVideo(videoId) {
 
   if (remaining() > 0) {
     const androidVrResponse = await ytAndroidVr(videoId, 2, Math.min(FETCH_TIMEOUT_MS, Math.max(1500, remaining() / 3)));
-    const extracted = extractMuxedUrl(androidVrResponse);
+    const extracted = extractMuxedUrl(androidVrResponse, 'ANDROID_VR');
     if (extracted) return extracted;
   }
 
   if (remaining() > 0) {
     const iosResponse = await ytIos(videoId, Math.min(FETCH_TIMEOUT_MS, remaining()));
-    const extracted = extractMuxedUrl(iosResponse);
+    const extracted = extractMuxedUrl(iosResponse, 'IOS');
     if (extracted) return extracted;
   }
 
   if (remaining() > 0) {
     const tvResponse = await ytTvEmbeddedBypass(videoId, Math.min(FETCH_TIMEOUT_MS, remaining()));
-    const extracted = extractMuxedUrl(tvResponse);
+    const extracted = extractMuxedUrl(tvResponse, 'TVHTML5_SIMPLY_EMBEDDED_PLAYER');
     if (extracted) return extracted;
   }
 
   if (remaining() > 0) {
     const piped = await ytPipedFallback(videoId, Math.min(4000, remaining()), deadlineAt);
-    if (piped) return piped;
+    if (piped) return { ...piped, client: 'PIPED' };
   }
 
   return null;
 }
 
-function extractMuxedUrl(playerResponse) {
+function extractMuxedUrl(playerResponse, clientName) {
   const muxed = playerResponse?.streamingData?.formats || [];
   const sorted = muxed.filter((f) => f.url).sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0));
   if (!sorted.length) return null;
@@ -243,6 +243,7 @@ function extractMuxedUrl(playerResponse) {
     mimeType: usable.mimeType || 'video/mp4',
     quality: usable.qualityLabel || null,
     isMuxed: true,
+    client: clientName,
   };
 }
 
@@ -260,15 +261,36 @@ async function handleVideoResolve(videoId) {
 // pattern) — lets the app just point a native video player at this URL
 // instead of round-tripping the resolved URL first, and supports Range
 // requests for seeking/buffering.
+const CLIENT_USER_AGENTS = {
+  ANDROID_VR: 'com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+  IOS: 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
+  TVHTML5_SIMPLY_EMBEDDED_PLAYER: 'Mozilla/5.0 (PlayStation; PlayStation 4/12.02) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15',
+  // Piped-sourced URLs are already publicly-servable CDN links (not
+  // freshly minted by a specific YT client in this request), a plain
+  // mobile browser UA is the right/expected one here.
+  PIPED: 'Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36',
+};
+
 async function handleVideoProxy(videoId, request) {
   if (!videoId) return new Response('id required', { status: 400 });
   const video = await resolveYtVideo(videoId);
   if (!video?.url) return new Response('Could not resolve video', { status: 502 });
 
   const rangeHeader = request.headers.get('Range');
+  // IMPORTANT: this User-Agent must match whichever client actually
+  // obtained `video.url` from YouTube (see resolveYtVideo — currently
+  // ANDROID_VR is tried first, then iOS, then TV embed, then Piped).
+  // googlevideo.com CDN URLs are bound to the requesting client's
+  // identity; a mismatched or generic browser User-Agent here can get
+  // the request silently throttled/truncated by the CDN — which is
+  // exactly the "loads one frame then stalls" symptom, since the
+  // connection succeeds enough to hand back a first chunk before
+  // getting cut off. `video.client` (set in resolveYtVideo) tells us
+  // exactly which one to send, instead of hardcoding a single guess.
+  const userAgent = CLIENT_USER_AGENTS[video.client] || CLIENT_USER_AGENTS.ANDROID_VR;
   const upstream = await fetch(video.url, {
     headers: {
-      'User-Agent': 'Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36',
+      'User-Agent': userAgent,
       ...(rangeHeader ? { Range: rangeHeader } : {}),
     },
   }).catch(() => null);
