@@ -1,15 +1,15 @@
 // =============================================================================
-// Aurum Shorts — Cloudflare Worker — YT VIDEO resolution (muxed)
+// Aurum Shorts â€” Cloudflare Worker â€” YT VIDEO resolution (muxed)
 //
 // Fully separate deploy from the main Aurum audio-resolution worker.
 // Same multi-client chain pattern (android_vr / ios / tv-embed / piped),
 // same budgeted-deadline approach so a single resolve can never hang the
-// app — but this one asks for MUXED (video+audio together) formats
+// app â€” but this one asks for MUXED (video+audio together) formats
 // instead of audio-only adaptiveFormats, since the Shorts feed plays one
 // combined stream per card rather than syncing a separate audio source.
 //
 // Isolated on purpose: own PO Token endpoint reference, own budget
-// constants, own route names — so this can be deployed as its own Worker
+// constants, own route names â€” so this can be deployed as its own Worker
 // and iterated on (or torn down) without touching the main audio worker
 // at all.
 // =============================================================================
@@ -39,9 +39,9 @@ async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
 }
 
 // =============================================================================
-// ATTEMPT — ANDROID_VR. In practice this client reliably returns muxed
+// ATTEMPT â€” ANDROID_VR. In practice this client reliably returns muxed
 // `formats` (not just split adaptiveFormats), which is exactly what we
-// want here — no PO Token needed for this one.
+// want here â€” no PO Token needed for this one.
 // =============================================================================
 async function ytAndroidVr(videoId, attempts, perAttemptTimeoutMs) {
   for (let i = 0; i < attempts; i++) {
@@ -80,7 +80,7 @@ async function ytAndroidVr(videoId, attempts, perAttemptTimeoutMs) {
 }
 
 // =============================================================================
-// ATTEMPT — iOS client. Fallback if android_vr's muxed formats are empty
+// ATTEMPT â€” iOS client. Fallback if android_vr's muxed formats are empty
 // for this video.
 // =============================================================================
 async function ytIos(videoId, timeoutMs) {
@@ -118,7 +118,7 @@ async function ytIos(videoId, timeoutMs) {
 }
 
 // =============================================================================
-// ATTEMPT — TVHTML5_SIMPLY_EMBEDDED_PLAYER bypass.
+// ATTEMPT â€” TVHTML5_SIMPLY_EMBEDDED_PLAYER bypass.
 // =============================================================================
 async function ytTvEmbeddedBypass(videoId, timeoutMs) {
   try {
@@ -156,7 +156,7 @@ async function ytTvEmbeddedBypass(videoId, timeoutMs) {
 }
 
 // =============================================================================
-// ATTEMPT — Piped, tried across multiple instances. Piped's `videoStreams`
+// ATTEMPT â€” Piped, tried across multiple instances. Piped's `videoStreams`
 // (as opposed to `audioStreams`) are muxed video+audio, which is exactly
 // the shape this Worker wants.
 // =============================================================================
@@ -172,7 +172,7 @@ async function ytPipedFallback(videoId, perInstanceTimeoutMs, deadlineAt) {
       const videoStreams = (data?.videoStreams || []).filter((s) => s.url && !s.videoOnly);
       if (!videoStreams.length) continue;
 
-      // Prefer smallest muxed stream that's still reasonably watchable —
+      // Prefer smallest muxed stream that's still reasonably watchable â€”
       // Shorts cards are small/vertical-cropped, no benefit to 1080p, and
       // smaller streams start noticeably faster on swipe.
       const sorted = videoStreams
@@ -196,7 +196,7 @@ async function ytPipedFallback(videoId, perInstanceTimeoutMs, deadlineAt) {
 }
 
 // =============================================================================
-// MAIN resolve — budgeted chain, same deadline discipline as the audio
+// MAIN resolve â€” budgeted chain, same deadline discipline as the audio
 // worker: never exceeds TOTAL_RESOLVE_BUDGET_MS regardless of how many
 // clients/instances are configured above.
 // =============================================================================
@@ -258,7 +258,7 @@ async function handleVideoResolve(videoId) {
 }
 
 // Optional direct-proxy route (mirrors the audio worker's /api/yt-proxy
-// pattern) — lets the app just point a native video player at this URL
+// pattern) â€” lets the app just point a native video player at this URL
 // instead of round-tripping the resolved URL first, and supports Range
 // requests for seeking/buffering.
 const CLIENT_USER_AGENTS = {
@@ -273,42 +273,20 @@ const CLIENT_USER_AGENTS = {
 
 async function handleVideoProxy(videoId, request) {
   if (!videoId) return new Response('id required', { status: 400 });
-
-  const { searchParams } = new URL(request.url);
-  const passedUrl = searchParams.get('url');
-  const passedClient = searchParams.get('client');
-
-  // FAST PATH: the caller (Dart _resolveStream) already resolved this
-  // videoId once via /api/video-resolve and is handing us that exact
-  // url + client back. Use it directly — do NOT re-run resolveYtVideo().
-  //
-  // Previously this function always re-resolved from scratch, meaning
-  // every single video-proxy request paid its own independent (up to
-  // TOTAL_RESOLVE_BUDGET_MS) resolve chain on top of the resolve the
-  // app had just done a moment earlier — two back-to-back 15s-budgeted
-  // chains before any bytes streamed, and since each chain is
-  // non-deterministic (whichever client wins the race), the second
-  // resolve could land on a different client/URL than the first. That
-  // showed up as long stalls and occasional silent failures on the
-  // Shorts feed (stuck on static artwork, video never crossfades in).
-  let video;
-  if (passedUrl && passedClient) {
-    video = { url: passedUrl, client: passedClient };
-  } else {
-    // Fallback path — old behavior, kept so this route still works if
-    // ever called with just an id (e.g. manual/debug hits).
-    video = await resolveYtVideo(videoId);
-    if (!video?.url) return new Response('Could not resolve video', { status: 502 });
-  }
+  const video = await resolveYtVideo(videoId);
+  if (!video?.url) return new Response('Could not resolve video', { status: 502 });
 
   const rangeHeader = request.headers.get('Range');
   // IMPORTANT: this User-Agent must match whichever client actually
-  // obtained `video.url` from YouTube. googlevideo.com CDN URLs are
-  // bound to the requesting client's identity; a mismatched or generic
-  // browser User-Agent here can get the request silently
-  // throttled/truncated by the CDN — which is exactly the "loads one
-  // frame then stalls" symptom, since the connection succeeds enough to
-  // hand back a first chunk before getting cut off.
+  // obtained `video.url` from YouTube (see resolveYtVideo â€” currently
+  // ANDROID_VR is tried first, then iOS, then TV embed, then Piped).
+  // googlevideo.com CDN URLs are bound to the requesting client's
+  // identity; a mismatched or generic browser User-Agent here can get
+  // the request silently throttled/truncated by the CDN â€” which is
+  // exactly the "loads one frame then stalls" symptom, since the
+  // connection succeeds enough to hand back a first chunk before
+  // getting cut off. `video.client` (set in resolveYtVideo) tells us
+  // exactly which one to send, instead of hardcoding a single guess.
   const userAgent = CLIENT_USER_AGENTS[video.client] || CLIENT_USER_AGENTS.ANDROID_VR;
   const upstream = await fetch(video.url, {
     headers: {
@@ -384,8 +362,8 @@ export default {
           'TVHTML5_SIMPLY_EMBEDDED_PLAYER (bypass, muxed formats)',
           `Piped videoStreams (multi-instance: ${PIPED_INSTANCES.join(', ')})`,
         ],
-        resolutionStrategy: 'budgeted sequential chain — hard 15s cap, muxed video+audio streams only',
-        note: 'Fully isolated from the main Aurum audio-resolution Worker — separate deploy, separate routes.',
+        resolutionStrategy: 'budgeted sequential chain â€” hard 15s cap, muxed video+audio streams only',
+        note: 'Fully isolated from the main Aurum audio-resolution Worker â€” separate deploy, separate routes.',
       });
     }
 
