@@ -35,13 +35,34 @@
 //      failed and why instead of a bare 502.
 // =============================================================================
 
-// PO Token provider — self-hosted bgutil-ytdlp-pot-provider on Render.
-// Same instance the main audio worker uses. Intentionally short timeout:
-// we are not trying to wait out a cold start here — see keepAlivePot()
-// below for how that's handled instead. If the provider doesn't answer in
-// 3s, we proceed without a token for this request rather than blocking it.
+// PO Token provider — self-hosted bgutil-ytdlp-pot-provider on Render,
+// paid/always-on tier (confirmed no cold-start issue).
+//
+// MEASURED REALITY (2026-07-15 diagnostics): a real /get_pot call took
+// ~11s (HTTP 200, valid poToken + expiresAt ~30min out). This is normal
+// BotGuard/DroidGuard challenge-solving time for this provider, NOT a
+// cold start — so the old POT_FETCH_TIMEOUT_MS=3000 was guaranteed to
+// timeout on EVERY request before the token could ever arrive. That's
+// why debug output showed poToken.ok=false, tookMs=3000 every time, which
+// cascaded into every other client (ANDROID_VR/IOS/TV all now blocked by
+// YouTube without a PO Token) and Piped (public instances, unreliable)
+// all failing too — the exact "No muxed video stream found" on every
+// video, including the always-available jNQXAC9IVRw.
+//
+// FIX: raise the timeout to comfortably cover the observed latency, AND
+// cache the token (see potCache below) so this 12s cost is paid rarely —
+// once per token lifetime (expiresAt), not once per video resolve.
 const POT_PROVIDER_URL = 'https://aurum-pot.onrender.com/get_pot';
-const POT_FETCH_TIMEOUT_MS = 3000;
+const POT_FETCH_TIMEOUT_MS = 12000;
+
+// In-memory token cache, scoped to this Worker isolate. Cloudflare keeps
+// an isolate warm across many requests (not just one), so in practice
+// this avoids the ~11s fetch on most requests — only the first request
+// after a cold isolate, or after the token's expiresAt passes, pays it.
+// This is a soft cache (lost on isolate recycle); for a hard guarantee
+// across all edge locations, migrate to Cloudflare KV instead (see notes
+// at bottom of file).
+let potCache = { poToken: null, visitorData: null, expiresAt: 0 };
 
 const FETCH_TIMEOUT_MS = 5000;
 
@@ -49,7 +70,15 @@ const FETCH_TIMEOUT_MS = 5000;
 // client + Piped instance combined. Guarantees the app never waits longer
 // than this for a resolve to give up, no matter how many retries/instances
 // are configured below.
-const TOTAL_RESOLVE_BUDGET_MS = 15000;
+//
+// Raised from 15000 to 20000: on a cold potCache (first request after an
+// isolate recycle, or the ~25min token expiry), the PO Token fetch alone
+// can legitimately take up to POT_FETCH_TIMEOUT_MS (12s, matching the
+// measured ~11s real latency). A 15s total budget left almost nothing for
+// ANDROID_VR/IOS/TV/Piped to run afterward on a cold-cache request. Most
+// requests will be far faster than this ceiling since potCache serves
+// instantly once warm — this only matters for the rare cold case.
+const TOTAL_RESOLVE_BUDGET_MS = 20000;
 
 // Multiple Piped instances tried in order. Each one is independently
 // operated and can go down without notice.
@@ -81,6 +110,15 @@ function withDeadline(promise, msLeft, fallbackValue = null) {
 }
 
 async function fetchPoToken() {
+  // Serve from cache if we still have a token that hasn't expired yet
+  // (with a 60s safety margin so we never hand out a token that expires
+  // mid-flight). This is what turns the ~11s provider latency from
+  // "every single request" into "roughly once per expiresAt window."
+  const now = Date.now();
+  if (potCache.poToken && potCache.expiresAt - 60000 > now) {
+    return { poToken: potCache.poToken, visitorData: potCache.visitorData };
+  }
+
   try {
     const resp = await fetchWithTimeout(POT_PROVIDER_URL, {
       method: 'POST',
@@ -90,6 +128,12 @@ async function fetchPoToken() {
     if (!resp.ok) return null;
     const data = await resp.json().catch(() => null);
     if (data?.poToken) {
+      const expiresAt = data.expiresAt ? Date.parse(data.expiresAt) : (now + 25 * 60000);
+      potCache = {
+        poToken: data.poToken,
+        visitorData: data.visitorData || null,
+        expiresAt: Number.isFinite(expiresAt) ? expiresAt : now + 25 * 60000,
+      };
       return { poToken: data.poToken, visitorData: data.visitorData || null };
     }
     return null;
@@ -644,6 +688,17 @@ function jsonResp(data, status = 200) {
 // =============================================================================
 // Main router
 // =============================================================================
+// NOTE on the in-memory potCache above: Cloudflare Workers isolates are
+// reused across many requests when traffic is steady, so in practice most
+// requests hit a warm cache and skip the ~11s fetch entirely. If you
+// later see the cold-fetch path firing more often than expected (e.g.
+// low/spiky traffic causing frequent isolate recycling), the fix is
+// Workers KV: create a KV namespace, bind it as `env.POT_KV`, and replace
+// the potCache reads/writes in fetchPoToken() with
+// `await env.POT_KV.get('pot')` / `await env.POT_KV.put('pot', ..., { expirationTtl })`.
+// That persists the token across isolate recycles and edge locations,
+// at the cost of a small KV read latency (still far cheaper than 11s).
+
 export default {
   async fetch(request, env, ctx) {
     const { pathname, searchParams } = new URL(request.url);
@@ -673,10 +728,13 @@ export default {
     if (pathname === '/health') {
       return jsonResp({
         status: 'ok',
-        worker: 'aurum-shorts-video-v2-budgeted',
+        worker: 'aurum-shorts-video-v3-pot-cached',
         potProvider: POT_PROVIDER_URL,
         totalResolveBudgetMs: TOTAL_RESOLVE_BUDGET_MS,
         potFetchTimeoutMs: POT_FETCH_TIMEOUT_MS,
+        potCacheStatus: potCache.poToken
+          ? { cached: true, expiresAt: new Date(potCache.expiresAt).toISOString() }
+          : { cached: false },
         ytClients: [
           'WEB_EMBEDDED_PLAYER (PO-Token, only if token obtained within 3s, muxed formats)',
           'ANDROID_VR (2 retries, muxed formats)',
