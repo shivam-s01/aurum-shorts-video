@@ -273,20 +273,42 @@ const CLIENT_USER_AGENTS = {
 
 async function handleVideoProxy(videoId, request) {
   if (!videoId) return new Response('id required', { status: 400 });
-  const video = await resolveYtVideo(videoId);
-  if (!video?.url) return new Response('Could not resolve video', { status: 502 });
+
+  const { searchParams } = new URL(request.url);
+  const passedUrl = searchParams.get('url');
+  const passedClient = searchParams.get('client');
+
+  // FAST PATH: the caller (Dart _resolveStream) already resolved this
+  // videoId once via /api/video-resolve and is handing us that exact
+  // url + client back. Use it directly — do NOT re-run resolveYtVideo().
+  //
+  // Previously this function always re-resolved from scratch, meaning
+  // every single video-proxy request paid its own independent (up to
+  // TOTAL_RESOLVE_BUDGET_MS) resolve chain on top of the resolve the
+  // app had just done a moment earlier — two back-to-back 15s-budgeted
+  // chains before any bytes streamed, and since each chain is
+  // non-deterministic (whichever client wins the race), the second
+  // resolve could land on a different client/URL than the first. That
+  // showed up as long stalls and occasional silent failures on the
+  // Shorts feed (stuck on static artwork, video never crossfades in).
+  let video;
+  if (passedUrl && passedClient) {
+    video = { url: passedUrl, client: passedClient };
+  } else {
+    // Fallback path — old behavior, kept so this route still works if
+    // ever called with just an id (e.g. manual/debug hits).
+    video = await resolveYtVideo(videoId);
+    if (!video?.url) return new Response('Could not resolve video', { status: 502 });
+  }
 
   const rangeHeader = request.headers.get('Range');
   // IMPORTANT: this User-Agent must match whichever client actually
-  // obtained `video.url` from YouTube (see resolveYtVideo — currently
-  // ANDROID_VR is tried first, then iOS, then TV embed, then Piped).
-  // googlevideo.com CDN URLs are bound to the requesting client's
-  // identity; a mismatched or generic browser User-Agent here can get
-  // the request silently throttled/truncated by the CDN — which is
-  // exactly the "loads one frame then stalls" symptom, since the
-  // connection succeeds enough to hand back a first chunk before
-  // getting cut off. `video.client` (set in resolveYtVideo) tells us
-  // exactly which one to send, instead of hardcoding a single guess.
+  // obtained `video.url` from YouTube. googlevideo.com CDN URLs are
+  // bound to the requesting client's identity; a mismatched or generic
+  // browser User-Agent here can get the request silently
+  // throttled/truncated by the CDN — which is exactly the "loads one
+  // frame then stalls" symptom, since the connection succeeds enough to
+  // hand back a first chunk before getting cut off.
   const userAgent = CLIENT_USER_AGENTS[video.client] || CLIENT_USER_AGENTS.ANDROID_VR;
   const upstream = await fetch(video.url, {
     headers: {
