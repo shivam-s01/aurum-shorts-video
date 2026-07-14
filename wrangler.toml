@@ -1,0 +1,19 @@
+# Aurum Shorts — YT video resolution Worker
+# Lives in its own subfolder (shorts-video-worker/) inside the existing
+# S.s-music repo so it can be deployed as a completely separate Cloudflare
+# Worker service, without touching the existing worker.js / wrangler.toml
+# at the repo root (that one is the main audio-resolution Worker — do not
+# overwrite it).
+#
+# When creating the Cloudflare Worker for this one (Workers & Pages →
+# Create → Import a repository), set:
+#   Root directory: shorts-video-worker
+# so Cloudflare only looks inside this folder for its own worker.js +
+# wrangler.toml, and never touches the root-level files.
+
+name = "aurum-shorts-video"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+[observability]
+enabled = true
